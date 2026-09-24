@@ -1,7 +1,6 @@
 package com.fabmisr.contractbridge.main;
 
 import com.fabmisr.contractbridge.config.AppConfig;
-import com.fabmisr.contractbridge.config.DESedeEncryption;
 import com.fabmisr.contractbridge.db.ContractWorkItemDao;
 import com.fabmisr.contractbridge.db.DBConnectionManager;
 import com.fabmisr.contractbridge.db.MasterDataDao;
@@ -16,18 +15,28 @@ import java.util.List;
 import org.apache.log4j.Logger;
 import org.apache.log4j.PropertyConfigurator;
 
-
+/**
+ * FabMisr Open Contract XML Bridge Utility.
+ * Runs continuously on an always-on VM, executing one processing cycle
+ * every WaitTime interval (default 24h, configured in Config.ini).
+ * Compatible with Java 1.7.
+ */
 public class OpenContractUtilityMain {
+
     private static final Logger logger = Logger.getLogger(OpenContractUtilityMain.class);
     private static volatile boolean running = true;
 
     public static void main(String[] args) {
-        // Initialize Log4j
         File log4jFile = new File("log4j.properties");
         if (log4jFile.exists()) {
             PropertyConfigurator.configure(log4jFile.getAbsolutePath());
         }
 
+        logger.info("==========================================================");
+        logger.info(" FabMisr Credit Bridge Utility (Java 1.7.0_151)");
+        logger.info(" Modules: 1- Contract File, 2- Card File, 3- Card Attribute File");
+        logger.info(" Mode: Continuous (long-running loop on always-on VM)");
+        logger.info("==========================================================");
 
         AppConfig config = AppConfig.getInstance();
         if (!config.loadConfiguration("Config.ini")) {
@@ -35,26 +44,24 @@ public class OpenContractUtilityMain {
             System.exit(1);
         }
 
-        // Setup Output Directory
         File outDir = new File(config.getOutputDir());
         if (!outDir.exists()) {
             outDir.mkdirs();
             logger.info("Created output directory: " + outDir.getAbsolutePath());
         }
 
+        Runtime.getRuntime().addShutdownHook(new Thread(new Runnable() {
+            public void run() {
+                logger.info("Shutdown signal received. Stopping FabMisr Credit Bridge Utility...");
+                running = false;
+            }
+        }));
 
         OpenContractUtilityMain service = new OpenContractUtilityMain();
-        boolean success = service.runOnce(config, outDir);
-        
-        if(success)
-            logger.info("FABMISR credit products bridge files finished");
-        else
-            logger.info("FABMISR credit products bridge files finished with error");           
-            
-        System.exit(success ? 0 : 1);
+        service.startService(config, outDir);
     }
 
-    public boolean runOnce(AppConfig config, File outDir) {
+    public void startService(AppConfig config, File outDir) {
         DBConnectionManager dbManager = DBConnectionManager.getInstance();
         ContractWorkItemDao contractDao = new ContractWorkItemDao();
         MasterDataDao masterDao = MasterDataDao.getInstance();
@@ -63,89 +70,98 @@ public class OpenContractUtilityMain {
         CardAttributeXmlGenerator cardAttXmlGen = new CardAttributeXmlGenerator();
 
         int dailySequence = 1;
-        Connection conn = null;
-        boolean overallSucess = true;
-        
-        try {
-            logger.info("--- Polling for candidate work items ready for Open Contract generation ---");
-            conn = dbManager.getConnection();
 
+        while (running) {
+            Connection conn = null;
+            boolean cycleSuccess = true;
 
-            // Load Master lookups
-            masterDao.loadMasterData(conn);
+            try {
+                logger.info("--- Polling for candidate work items ready for Open Contract generation ---");
+                conn = dbManager.getConnection();
 
-            // Fetch work items
-            List<String> candidateWorkItems = contractDao.fetchCandidateWorkItems(conn);
-            logger.info("Found " + candidateWorkItems.size() + " candidate work item(s) to process.");
+                masterDao.loadMasterData(conn);
 
-            if (!candidateWorkItems.isEmpty()) {
-                List<ContractCustomerRecord> batchRecords = new ArrayList<ContractCustomerRecord>();
+                List<String> candidateWorkItems = contractDao.fetchCandidateWorkItems(conn);
+                logger.info("Found " + candidateWorkItems.size() + " candidate work item(s) to process.");
 
-                for (String winame : candidateWorkItems) {
-                    try {
-                        ContractCustomerRecord record = contractDao.fetchContractCustomerRecord(conn, winame);
-                        if (record != null && record.getCifId() != null && !record.getCifId().trim().isEmpty()) {
-                            batchRecords.add(record);
-                        } else {
-                            logger.warn("Skipping WINAME " + winame + " due to missing CIF ID.");
+                if (!candidateWorkItems.isEmpty()) {
+                    List<ContractCustomerRecord> batchRecords = new ArrayList<ContractCustomerRecord>();
+
+                    for (String winame : candidateWorkItems) {
+                        try {
+                            ContractCustomerRecord record = contractDao.fetchContractCustomerRecord(conn, winame);
+                            if (record != null && record.getCifId() != null && !record.getCifId().trim().isEmpty()) {
+                                batchRecords.add(record);
+                            } else {
+                                logger.warn("Skipping WINAME " + winame + " due to missing CIF ID.");
+                            }
+                        } catch (Exception e) {
+                            logger.error("Error loading details for WINAME " + winame + ": " + e.getMessage(), e);
                         }
-                    } catch (Exception e) {
-                        logger.error("Error loading details for WINAME " + winame + ": " + e.getMessage(), e);
                     }
-                }
 
-                if (!batchRecords.isEmpty()) {
-                    logger.info("Generating Open Contract XML file for batch of " + batchRecords.size() + " records...");
-                    File contractFile = openContractGen.generateFile(batchRecords, outDir, dailySequence);
+                    if (!batchRecords.isEmpty()) {
+                        logger.info("Generating Open Contract XML file for batch of " + batchRecords.size() + " records...");
+                        File contractFile = openContractGen.generateFile(batchRecords, outDir, dailySequence);
 
-                    if (contractFile != null) {
-                        logger.info("Open Contract XML file generated successfully: " + contractFile.getName());
-                        logger.info("Generating Card XML file for batch of " + batchRecords.size() + " records...");
-                        File cardFile = cardXmlGen.generateFile(batchRecords, outDir, dailySequence);
+                        if (contractFile != null) {
+                            logger.info("Open Contract XML file generated successfully: " + contractFile.getName());
 
-                        if (cardFile != null) {
-                            logger.info("Card XML file generated successfully: " + cardFile.getName());
-                            logger.info("Generating Card Attribute XML file for batch of " + batchRecords.size() + " records...");
-                            File cardAttributeFile = cardAttXmlGen.generateFile(batchRecords, outDir, dailySequence);
+                            logger.info("Generating Card XML file for batch of " + batchRecords.size() + " records...");
+                            File cardFile = cardXmlGen.generateFile(batchRecords, outDir, dailySequence);
 
-                            if(cardAttributeFile != null)
-                               logger.info("Card Attribute XML file generated successfully: " + cardAttributeFile.getName());
-                            else
-                            {
-                               logger.error("Card Attribute XML generation failed for current batch.");
-                               overallSucess = false;
+                            if (cardFile != null) {
+                                logger.info("Card XML file generated successfully: " + cardFile.getName());
+
+                                logger.info("Generating Card Attribute XML file for batch of " + batchRecords.size() + " records...");
+                                File cardAttributeFile = cardAttXmlGen.generateFile(batchRecords, outDir, dailySequence);
+
+                                if (cardAttributeFile != null) {
+                                    logger.info("Card Attribute XML file generated successfully: " + cardAttributeFile.getName());
+                                } else {
+                                    logger.error("Card Attribute XML generation failed for current batch.");
+                                    cycleSuccess = false;
+                                }
+                            } else {
+                                logger.error("Card XML generation failed for current batch.");
+                                cycleSuccess = false;
                             }
 
-                        }
-                        else
-                        {
-                            logger.error("Card XML generation failed for current batch.");
-                            overallSucess = false;
-                        }
+                            // TODO: confirm before enabling on production - marks records as sent
+                            // if (config.isUpdateStatusInDB()) {
+                            //     for (ContractCustomerRecord rec : batchRecords) {
+                            //         contractDao.updateWorkItemStatus(conn, rec.getWiname());
+                            //     }
+                            // }
 
-//                            // Update Database Flags if enabled
-//                            if (config.isUpdateStatusInDB()) {
-//                                for (ContractCustomerRecord rec : batchRecords) {
-//                                    contractDao.updateWorkItemStatus(conn, rec.getWiname());
-//                                }
-//                            }
-                        dailySequence++;
-                    } else {
-                        logger.error("Open Contract XML generation failed for current batch.");
-                        overallSucess = false;
+                            dailySequence++;
+                        } else {
+                            logger.error("Open Contract XML generation failed for current batch.");
+                            cycleSuccess = false;
+                        }
                     }
+                } else {
+                    logger.info("No candidate work items found. Nothing to generate this cycle.");
                 }
-            }
+
+                logger.info("Cycle finished " + (cycleSuccess ? "successfully." : "with errors."));
 
             } catch (Exception e) {
                 logger.error("Error during polling cycle: " + e.getMessage(), e);
-                overallSucess = false;
             } finally {
                 DBConnectionManager.closeQuietly(conn);
             }
-        
-        return overallSucess;
+
+            try {
+                if (running) {
+                    logger.info("Sleeping for " + (config.getWaitTimeMs() / 1000) + " seconds until next cycle...");
+                    Thread.sleep(config.getWaitTimeMs());
+                }
+            } catch (InterruptedException e) {
+                logger.info("Utility sleep interrupted.");
+            }
+        }
+
+        logger.info("FabMisr Credit Bridge Utility stopped cleanly.");
     }
-
 }
-
