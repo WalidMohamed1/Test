@@ -1,1 +1,151 @@
+package com.fabmisr.contractbridge.main;
+
+import com.fabmisr.contractbridge.config.AppConfig;
+import com.fabmisr.contractbridge.config.DESedeEncryption;
+import com.fabmisr.contractbridge.db.ContractWorkItemDao;
+import com.fabmisr.contractbridge.db.DBConnectionManager;
+import com.fabmisr.contractbridge.db.MasterDataDao;
+import com.fabmisr.contractbridge.generator.CardAttributeXmlGenerator;
+import com.fabmisr.contractbridge.generator.CardXmlGenerator;
+import com.fabmisr.contractbridge.generator.OpenContractXmlGenerator;
+import com.fabmisr.contractbridge.model.ContractCustomerRecord;
+import java.io.File;
+import java.sql.Connection;
+import java.util.ArrayList;
+import java.util.List;
+import org.apache.log4j.Logger;
+import org.apache.log4j.PropertyConfigurator;
+
+
+public class OpenContractUtilityMain {
+    private static final Logger logger = Logger.getLogger(OpenContractUtilityMain.class);
+    private static volatile boolean running = true;
+
+    public static void main(String[] args) {
+        // Initialize Log4j
+        File log4jFile = new File("log4j.properties");
+        if (log4jFile.exists()) {
+            PropertyConfigurator.configure(log4jFile.getAbsolutePath());
+        }
+
+
+        AppConfig config = AppConfig.getInstance();
+        if (!config.loadConfiguration("Config.ini")) {
+            logger.error("Failed to load configuration. Exiting utility.");
+            System.exit(1);
+        }
+
+        // Setup Output Directory
+        File outDir = new File(config.getOutputDir());
+        if (!outDir.exists()) {
+            outDir.mkdirs();
+            logger.info("Created output directory: " + outDir.getAbsolutePath());
+        }
+
+
+        OpenContractUtilityMain service = new OpenContractUtilityMain();
+        boolean success = service.runOnce(config, outDir);
+        
+        if(success)
+            logger.info("FABMISR credit products bridge files finished");
+        else
+            logger.info("FABMISR credit products bridge files finished with error");           
+            
+        System.exit(success ? 0 : 1);
+    }
+
+    public boolean runOnce(AppConfig config, File outDir) {
+        DBConnectionManager dbManager = DBConnectionManager.getInstance();
+        ContractWorkItemDao contractDao = new ContractWorkItemDao();
+        MasterDataDao masterDao = MasterDataDao.getInstance();
+        OpenContractXmlGenerator openContractGen = new OpenContractXmlGenerator();
+        CardXmlGenerator cardXmlGen = new CardXmlGenerator();
+        CardAttributeXmlGenerator cardAttXmlGen = new CardAttributeXmlGenerator();
+
+        int dailySequence = 1;
+        Connection conn = null;
+        boolean overallSucess = true;
+        
+        try {
+            logger.info("--- Polling for candidate work items ready for Open Contract generation ---");
+            conn = dbManager.getConnection();
+
+
+            // Load Master lookups
+            masterDao.loadMasterData(conn);
+
+            // Fetch work items
+            List<String> candidateWorkItems = contractDao.fetchCandidateWorkItems(conn);
+            logger.info("Found " + candidateWorkItems.size() + " candidate work item(s) to process.");
+
+            if (!candidateWorkItems.isEmpty()) {
+                List<ContractCustomerRecord> batchRecords = new ArrayList<ContractCustomerRecord>();
+
+                for (String winame : candidateWorkItems) {
+                    try {
+                        ContractCustomerRecord record = contractDao.fetchContractCustomerRecord(conn, winame);
+                        if (record != null && record.getCifId() != null && !record.getCifId().trim().isEmpty()) {
+                            batchRecords.add(record);
+                        } else {
+                            logger.warn("Skipping WINAME " + winame + " due to missing CIF ID.");
+                        }
+                    } catch (Exception e) {
+                        logger.error("Error loading details for WINAME " + winame + ": " + e.getMessage(), e);
+                    }
+                }
+
+                if (!batchRecords.isEmpty()) {
+                    logger.info("Generating Open Contract XML file for batch of " + batchRecords.size() + " records...");
+                    File contractFile = openContractGen.generateFile(batchRecords, outDir, dailySequence);
+
+                    if (contractFile != null) {
+                        logger.info("Open Contract XML file generated successfully: " + contractFile.getName());
+                        logger.info("Generating Card XML file for batch of " + batchRecords.size() + " records...");
+                        File cardFile = cardXmlGen.generateFile(batchRecords, outDir, dailySequence);
+
+                        if (cardFile != null) {
+                            logger.info("Card XML file generated successfully: " + cardFile.getName());
+                            logger.info("Generating Card Attribute XML file for batch of " + batchRecords.size() + " records...");
+                            File cardAttributeFile = cardAttXmlGen.generateFile(batchRecords, outDir, dailySequence);
+
+                            if(cardAttributeFile != null)
+                               logger.info("Card Attribute XML file generated successfully: " + cardAttributeFile.getName());
+                            else
+                            {
+                               logger.error("Card Attribute XML generation failed for current batch.");
+                               overallSucess = false;
+                            }
+
+                        }
+                        else
+                        {
+                            logger.error("Card XML generation failed for current batch.");
+                            overallSucess = false;
+                        }
+
+//                            // Update Database Flags if enabled
+//                            if (config.isUpdateStatusInDB()) {
+//                                for (ContractCustomerRecord rec : batchRecords) {
+//                                    contractDao.updateWorkItemStatus(conn, rec.getWiname());
+//                                }
+//                            }
+                        dailySequence++;
+                    } else {
+                        logger.error("Open Contract XML generation failed for current batch.");
+                        overallSucess = false;
+                    }
+                }
+            }
+
+            } catch (Exception e) {
+                logger.error("Error during polling cycle: " + e.getMessage(), e);
+                overallSucess = false;
+            } finally {
+                DBConnectionManager.closeQuietly(conn);
+            }
+        
+        return overallSucess;
+    }
+
+}
 
